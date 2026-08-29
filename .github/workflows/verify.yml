@@ -1,0 +1,140 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      # These majors run on Node 24. Older ones (checkout@v4, setup-node@v4,
+      # pnpm/action-setup@v4) target the deprecated Node 20 runtime and make every run carry a
+      # deprecation annotation, which trains people to ignore annotations.
+      - uses: actions/checkout@v7
+
+      # No `version:` here on purpose — `packageManager` in package.json pins pnpm, and
+      # specifying it in both places fails with ERR_PNPM_BAD_PM_VERSION.
+      - uses: pnpm/action-setup@v6
+
+      # Node version comes from .nvmrc, so CI and a contributor's shell cannot disagree.
+      # One fact, one place — the same rule the rest of this repo runs on.
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # ---- gates: a non-zero exit reddens the build -----------------------------------
+      #
+      # Each of these catches something whose breach produces NO error anywhere else. That is
+      # the whole reason they are here rather than only in `pnpm verify`: a contract enforced
+      # only by `verify` is enforced on whichever machine happens to run it.
+
+      - run: pnpm format:check
+
+      - run: pnpm typecheck
+
+      # Style Dictionary skips a file with zero tokens rather than erroring, so a broken glob
+      # would otherwise look exactly like an empty token set. The build script covers that case
+      # explicitly and exits non-zero on a real failure.
+      - run: pnpm build:tokens
+
+      # A contract can name a part that never renders, a state nothing can enter, or a prop
+      # value that was never in the axis — and the app still compiles, the tests still pass,
+      # and the component still works. Nothing but this step notices.
+      - run: pnpm verify:contract
+
+      # The glossary only catches a synonym by comparing value sets ACROSS components, which no
+      # per-component review can see. Nothing about an off-canon prop breaks a build, so without
+      # this the glossary silently goes stale and stops being worth consulting.
+      - run: pnpm prop-map:check
+
+      # The index is derived from the records. Forget to regenerate it and the record becomes
+      # invisible — nobody browses a directory listing — while every other tool stays green.
+      - run: pnpm adr-index:check
+
+      # This repo points instead of restating, so its characteristic defect is a pointer that
+      # resolves to nothing: a moved schema, a deleted skill, a `pnpm` script that was never
+      # added. Docs still render, the build still passes, the reader lands on nothing.
+      - run: pnpm verify:docs
+
+      # .figma/ is read by no build step, so a malformed entry is invisible until someone
+      # trusts it. An unmapped collection claiming a code path is the specific lie to catch.
+      - run: pnpm verify:figma
+
+      - run: pnpm build:react
+
+      - run: pnpm test
+
+      # ---- reports: printed, never fail ------------------------------------------------
+      #
+      # These would fail on everything the day a system starts, and a gate that fails on
+      # everything gets switched off. Promoting one is deliberate work against a clean baseline.
+
+      - name: contract coverage (report)
+        run: pnpm contract --coverage
+
+      - name: token policy vs stylesheet (report)
+        run: pnpm report:paints
+
+  # ---------------------------------------------------------------------------------------
+  # The first command every user of this template runs is `pnpm init-ds <name>`. If that leaves
+  # the repo in a state that fails `pnpm verify`, the first thing a newcomer sees is a red gate
+  # they did not cause — which is worse than no gate, because it teaches them the gates lie.
+  #
+  # This is not hypothetical: renaming changes string widths inside markdown tables, so Prettier's
+  # column alignment went stale and format:check failed. It was found by hand and fixed once.
+  # Nothing but this job stops it coming back.
+  #
+  # The matrix covers a name shorter and a name much longer than the default `ds`, because the
+  # failure was width-dependent and only shows up when columns actually shift.
+  init-ds:
+    name: init-ds (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [weave, acmedesignsystem]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: rename
+        run: pnpm init-ds ${{ matrix.name }}
+
+      # The scope moved, so the workspace links have to be re-resolved. No --frozen-lockfile:
+      # the lockfile legitimately changes here, and that is the point of the step.
+      - run: pnpm install --no-frozen-lockfile
+
+      - name: the renamed repo must still be green
+        run: pnpm verify
+
+      # A half-rename is the failure this whole codemod exists to prevent, and it produces no
+      # build error — so assert directly that nothing kept the old prefix.
+      - name: no stragglers left behind
+        run: |
+          if grep -rIn --exclude-dir=node_modules --exclude-dir=.git \
+               --exclude=init-ds.mjs --exclude=pnpm-lock.yaml \
+               -e '--ds-' -e '@ds/' -e 'data-ds-' . ; then
+            echo "::error::Found references to the old prefix after init-ds."
+            exit 1
+          fi
+          echo "No stragglers."
